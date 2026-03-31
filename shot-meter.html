@@ -1,0 +1,550 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+  <meta charset="UTF-8">
+  <title>Shot Meter</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      background: #0a0a0f;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 16px;
+      height: 100vh;
+      overflow: hidden;
+      user-select: none;
+      -webkit-user-select: none;
+      touch-action: manipulation;
+      font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+    }
+    .controls {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 10px 14px;
+      border: 1px solid #252550;
+      border-radius: 12px;
+      background: rgba(21, 21, 42, 0.92);
+      color: #d0d5e8;
+    }
+    .controls label {
+      font-size: 13px;
+      color: #a9afd1;
+    }
+    .controls input[type="range"] {
+      width: 180px;
+    }
+    .controls input[type="number"] {
+      width: 60px;
+      padding: 4px 6px;
+      border: 1px solid #3d3d6a;
+      border-radius: 8px;
+      background: #0f1020;
+      color: #ffffff;
+      font-size: 13px;
+    }
+    canvas {
+      display: block;
+      max-width: min(700px, calc(100vw - 24px));
+      height: auto;
+      touch-action: none;
+    }
+  </style>
+</head>
+<body>
+<div class="controls">
+  <label for="windowNumber">绿窗值</label>
+  <input id="windowRange" type="range" min="60" max="99" value="60">
+  <input id="windowNumber" type="number" min="60" max="99" value="60">
+  <label for="speedNumber">出手速度</label>
+  <input id="speedRange" type="range" min="300" max="1200" step="10" value="700">
+  <input id="speedNumber" type="number" min="300" max="1200" step="10" value="700">
+</div>
+<canvas id="game" width="700" height="360"></canvas>
+<script>
+const canvas = document.getElementById('game');
+const ctx    = canvas.getContext('2d');
+const windowRange  = document.getElementById('windowRange');
+const windowNumber = document.getElementById('windowNumber');
+const speedRange   = document.getElementById('speedRange');
+const speedNumber  = document.getElementById('speedNumber');
+
+// ── Constants ──────────────────────────────────────────────────────────────
+const FILL_MS_DEFAULT = 700;   // ms: full arc 0→100
+const FILL_MS_MIN     = 300;
+const FILL_MS_MAX     = 1200;
+const RESULT_MS = 1600;
+
+// t-based judgment windows (t = 0..100, peak = 50)
+const GREEN_RATING_MIN = 60;
+const GREEN_RATING_MAX = 99;
+const BASE_GREEN_LO    = 48;
+const BASE_GREEN_HI    = 52;
+const MAX_GREEN_LO     = 40;
+const MAX_GREEN_HI     = 60;
+const T_BUF      = 5;    // 略早 [43,48)  /  略晚 (52,57]
+
+// Vertical bar
+const BAR_W  = 46;
+const BAR_H  = 278;
+const BAR_X  = Math.floor((canvas.width - BAR_W) / 2);  // 327
+const BAR_Y  = 36;
+const BAR_BOT = BAR_Y + BAR_H;
+
+// Right panel text x-center
+const TX = 530;
+
+const C = {
+  bg:        '#0a0a0f',
+  barBg:     '#15152a',
+  barBorder: '#252550',
+  fill:      '#d0d5e8',
+  green:     '#00e86c',
+  yellow:    '#f5c518',
+  red:       '#e63946',
+  white:     '#ffffff',
+  dim:       '#252550',
+  dimText:   '#3d3d6a',
+  label:     '#7070a0',
+};
+
+const JUDGE = {
+  green:  { label: '绿了！', color: C.green,  big: true,  flash: true  },
+  early:  { label: '略早',   color: C.yellow, big: false, flash: false },
+  late:   { label: '略晚',   color: C.yellow, big: false, flash: false },
+  vEarly: { label: '过早',   color: C.red,    big: false, flash: false },
+  vLate:  { label: '过晚',   color: C.red,    big: false, flash: false },
+};
+
+// ── State ──────────────────────────────────────────────────────────────────
+/*
+ *  t goes 0 → 100 linearly (one arc = FILL_MS)
+ *  Visual height = tToVis(t):
+ *
+ *   vis%
+ *   100% ──── peak (t=50) ─────
+ *    96%     GREEN ZONE        ← rating=60 时是 [t=48..52]
+ *    86%   YELLOW BUFFER       ← rating=60 时是 [t=43..48] early / [t=52..57] late
+ *     0%  ──────────────────────
+ *
+ *  Release judgment:
+ *    t < 43              → 过早
+ *    t ∈ [43, 48)        → 略早
+ *    t ∈ [48, 52]        → 绿了
+ *    t ∈ (52, 57]        → 略晚
+ *    t > 57 or t = 100   → 过晚
+ */
+
+let state = mkIdle();
+let greenRating = GREEN_RATING_MIN;
+let fillMs = FILL_MS_DEFAULT;
+
+function mkIdle() {
+  return {
+    phase:           'idle',
+    t:               0,
+    lastTimestamp:   null,
+    judgment:        null,
+    resultStartTime: null,
+    markerT:         null,   // t value at release (for marker position)
+    flashAlpha:      0,
+  };
+}
+
+function reset() { state = mkIdle(); }
+
+// ── Coordinate helpers ─────────────────────────────────────────────────────
+function clamp(v, min, max) { return Math.min(max, Math.max(min, v)); }
+function lerp(a, b, t) { return a + (b - a) * t; }
+
+// t (0..100) → visual height % (0 = bottom, 100 = top)
+function tToVis(t) { return t <= 50 ? t * 2 : (100 - t) * 2; }
+
+// visual % → pixel Y from top
+function visToY(vis) { return BAR_BOT - (vis / 100) * BAR_H; }
+
+// t → pixel Y
+function tToY(t) { return visToY(tToVis(t)); }
+
+function getWindows() {
+  const ratio = (greenRating - GREEN_RATING_MIN) / (GREEN_RATING_MAX - GREEN_RATING_MIN);
+  const greenLo = lerp(BASE_GREEN_LO, MAX_GREEN_LO, ratio);
+  const greenHi = lerp(BASE_GREEN_HI, MAX_GREEN_HI, ratio);
+  const bufLo = Math.max(0, greenLo - T_BUF);
+  const bufHi = Math.min(100, greenHi + T_BUF);
+
+  // 视觉上用最低的可见高度做整段引导，范围变宽时能直观看到窗口在放大。
+  const visGreen = Math.min(tToVis(greenLo), tToVis(greenHi));
+  const visBuf = Math.min(tToVis(bufLo), tToVis(bufHi));
+
+  return { greenLo, greenHi, bufLo, bufHi, visGreen, visBuf };
+}
+
+function syncRatingInputs(nextValue) {
+  greenRating = clamp(Math.round(Number(nextValue) || GREEN_RATING_MIN), GREEN_RATING_MIN, GREEN_RATING_MAX);
+  windowRange.value = String(greenRating);
+  windowNumber.value = String(greenRating);
+}
+
+function syncSpeedInputs(nextValue) {
+  fillMs = clamp(Math.round(Number(nextValue) || FILL_MS_DEFAULT), FILL_MS_MIN, FILL_MS_MAX);
+  speedRange.value = String(fillMs);
+  speedNumber.value = String(fillMs);
+}
+
+// ── Judgment ───────────────────────────────────────────────────────────────
+function classify(t) {
+  const { greenLo, greenHi, bufLo, bufHi } = getWindows();
+  if (t >= greenLo && t <= greenHi) return 'green';
+  if (t >= bufLo && t < greenLo)    return 'early';
+  if (t > greenHi && t <= bufHi)    return 'late';
+  if (t < bufLo)                    return 'vEarly';
+  return 'vLate';
+}
+
+function devText(key, t) {
+  const { greenLo, greenHi } = getWindows();
+  switch (key) {
+    case 'early':  return `早了 ${(greenLo - t).toFixed(1)}`;
+    case 'late':   return `晚了 ${(t - greenHi).toFixed(1)}`;
+    case 'vEarly': return `过早 ${(greenLo - t).toFixed(1)}`;
+    case 'vLate':  return t >= 100 ? '过晚（满）' : `过晚 ${(t - greenHi).toFixed(1)}`;
+    default:       return '';
+  }
+}
+
+function triggerResult(t, ts) {
+  const key = classify(t);
+  Object.assign(state, {
+    phase:           'result',
+    judgment:        key,
+    markerT:         t,
+    t:               t,
+    resultStartTime: ts,
+    flashAlpha:      JUDGE[key].flash ? 0.36 : 0,
+  });
+}
+
+// ── Input ──────────────────────────────────────────────────────────────────
+function startHold() {
+  if (state.phase !== 'idle') return;
+  Object.assign(state, {
+    phase:         'holding',
+    t:             0,
+    lastTimestamp: null,
+    markerT:       null,
+    judgment:      null,
+    flashAlpha:    0,
+  });
+}
+
+function releaseHold() {
+  if (state.phase !== 'holding') return;
+  triggerResult(state.t, performance.now());
+}
+
+document.addEventListener('keydown', e => {
+  if (e.code !== 'Space') return;
+  e.preventDefault();
+  if (e.repeat) return;
+  startHold();
+});
+
+document.addEventListener('keyup', e => {
+  if (e.code !== 'Space') return;
+  releaseHold();
+});
+
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden && state.phase === 'holding') reset();
+});
+
+window.addEventListener('blur', () => {
+  if (state.phase === 'holding') reset();
+});
+
+canvas.addEventListener('pointerdown', e => {
+  if (e.pointerType !== 'mouse' || e.button === 0) {
+    e.preventDefault();
+    startHold();
+  }
+});
+
+canvas.addEventListener('pointerup', e => {
+  e.preventDefault();
+  releaseHold();
+});
+
+canvas.addEventListener('pointercancel', () => {
+  if (state.phase === 'holding') reset();
+});
+
+canvas.addEventListener('pointerleave', e => {
+  if (e.pointerType !== 'mouse') return;
+  if (state.phase === 'holding' && (e.buttons & 1) === 0) releaseHold();
+});
+
+canvas.addEventListener('contextmenu', e => {
+  e.preventDefault();
+});
+
+windowRange.addEventListener('input', e => {
+  syncRatingInputs(e.target.value);
+});
+
+windowNumber.addEventListener('input', e => {
+  syncRatingInputs(e.target.value);
+});
+
+windowNumber.addEventListener('blur', () => {
+  syncRatingInputs(windowNumber.value);
+});
+
+speedRange.addEventListener('input', e => {
+  syncSpeedInputs(e.target.value);
+});
+
+speedNumber.addEventListener('input', e => {
+  syncSpeedInputs(e.target.value);
+});
+
+speedNumber.addEventListener('blur', () => {
+  syncSpeedInputs(speedNumber.value);
+});
+
+syncRatingInputs(GREEN_RATING_MIN);
+syncSpeedInputs(FILL_MS_DEFAULT);
+
+// ── Drawing ────────────────────────────────────────────────────────────────
+function vcapsule(x, y, w, h) {
+  const r = w / 2;
+  ctx.beginPath();
+  ctx.arc(x + r, y + r,     r, Math.PI, 0);
+  ctx.lineTo(x + w, y + h - r);
+  ctx.arc(x + r, y + h - r, r, 0, Math.PI);
+  ctx.closePath();
+}
+
+function drawBar() {
+  const vis = tToVis(state.t);
+  const { visGreen, visBuf } = getWindows();
+
+  // ── 1. Background ──
+  ctx.fillStyle = C.barBg;
+  vcapsule(BAR_X, BAR_Y, BAR_W, BAR_H);
+  ctx.fill();
+  ctx.strokeStyle = C.barBorder;
+  ctx.lineWidth   = 1.5;
+  vcapsule(BAR_X, BAR_Y, BAR_W, BAR_H);
+  ctx.stroke();
+
+  // ── 2. Dim zone guides (always visible on empty bar) ──
+  ctx.save();
+  vcapsule(BAR_X, BAR_Y, BAR_W, BAR_H);
+  ctx.clip();
+
+  // Yellow guide
+  ctx.fillStyle   = C.yellow;
+  ctx.globalAlpha = 0.12;
+  ctx.fillRect(BAR_X, visToY(visGreen), BAR_W, (visGreen - visBuf) / 100 * BAR_H);
+
+  // Green guide
+  ctx.fillStyle   = C.green;
+  ctx.globalAlpha = 0.2;
+  ctx.fillRect(BAR_X, visToY(100), BAR_W, (100 - visGreen) / 100 * BAR_H);
+  ctx.globalAlpha = 1;
+
+  // ── 3. Colored fill (white → yellow → green) ──
+  if (vis > 0) {
+    const sections = [
+      { lo: 0,        hi: visBuf,   color: C.fill   },
+      { lo: visBuf,   hi: visGreen, color: C.yellow },
+      { lo: visGreen, hi: 100,      color: C.green  },
+    ];
+    sections.forEach(({ lo, hi, color }) => {
+      const fLo = Math.max(lo, 0);
+      const fHi = Math.min(hi, vis);
+      if (fHi <= fLo) return;
+      ctx.fillStyle = color;
+      const y = visToY(fHi);
+      const h = (fHi - fLo) / 100 * BAR_H;
+      ctx.fillRect(BAR_X, y, BAR_W, h);
+    });
+  }
+
+  // ── 4. Release marker ──
+  if (state.markerT !== null) {
+    const mVis    = tToVis(state.markerT);
+    const mY      = visToY(mVis);
+    const mColor  = JUDGE[state.judgment]?.color ?? C.white;
+    ctx.fillStyle = mColor;
+    ctx.fillRect(BAR_X, mY - 2, BAR_W, 4);
+  }
+
+  ctx.restore();
+
+  // ── 5. Green zone bracket ticks ──
+  const gTop = visToY(100);
+  const gBot = visToY(visGreen);
+  ctx.lineWidth   = 2;
+  ctx.strokeStyle = C.green;
+  ctx.globalAlpha = 0.7;
+  [gTop, gBot].forEach(ty => {
+    ctx.beginPath();
+    ctx.moveTo(BAR_X - 9, ty);
+    ctx.lineTo(BAR_X + BAR_W + 9, ty);
+    ctx.stroke();
+  });
+  ctx.globalAlpha = 1;
+
+  // ── 6. Direction arrow (right of bar, during HOLDING) ──
+  if (state.phase === 'holding') {
+    const ay  = tToY(state.t);
+    const ax  = BAR_X + BAR_W + 14;
+    const up  = state.t <= 50;
+
+    // Color based on zone
+    const zoneKey  = classify(state.t);
+    const inGreen  = zoneKey === 'green';
+    const inBuf    = zoneKey === 'early' || zoneKey === 'late';
+    ctx.fillStyle   = inGreen ? C.green : inBuf ? C.yellow : C.label;
+    ctx.globalAlpha = 0.85;
+    ctx.beginPath();
+    if (up) {
+      ctx.moveTo(ax + 4, ay - 7);
+      ctx.lineTo(ax,     ay + 3);
+      ctx.lineTo(ax + 8, ay + 3);
+    } else {
+      ctx.moveTo(ax + 4, ay + 7);
+      ctx.lineTo(ax,     ay - 3);
+      ctx.lineTo(ax + 8, ay - 3);
+    }
+    ctx.fill();
+    ctx.globalAlpha = 1;
+  }
+}
+
+function drawRightPanel() {
+  const cy = canvas.height / 2;
+  const { greenLo, greenHi } = getWindows();
+  ctx.textAlign    = 'center';
+  ctx.textBaseline = 'middle';
+
+  // Flash overlay
+  if (state.flashAlpha > 0) {
+    ctx.fillStyle   = C.green;
+    ctx.globalAlpha = state.flashAlpha;
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.globalAlpha = 1;
+    state.flashAlpha = Math.max(0, state.flashAlpha - 0.015);
+  }
+
+  if (state.phase === 'idle') {
+    ctx.font      = 'bold 12px -apple-system, sans-serif';
+    ctx.fillStyle = C.dimText;
+    ctx.fillText('SHOT METER', TX, cy - 72);
+
+    ctx.font      = '13px -apple-system, sans-serif';
+    ctx.fillStyle = C.label;
+    ctx.fillText(`绿窗值 ${greenRating}  |  绿区 [t ${greenLo.toFixed(0)}-${greenHi.toFixed(0)}]`, TX, cy - 50);
+    ctx.fillText(`出手速度 ${fillMs}ms`, TX, cy - 34);
+
+    ctx.font      = '19px -apple-system, sans-serif';
+    ctx.fillStyle = C.dim;
+    ctx.fillText('按住开始', TX, cy - 16);
+
+    // Spacebar key
+    const kw = 84, kh = 28, kx = TX - kw / 2, ky = cy + 6;
+    ctx.strokeStyle = C.dim;
+    ctx.lineWidth   = 1.5;
+    ctx.strokeRect(kx, ky, kw, kh);
+    ctx.font      = '12px -apple-system, sans-serif';
+    ctx.fillStyle = C.dimText;
+    ctx.fillText('SPACE / TOUCH', TX, ky + kh / 2);
+
+    // Legend
+    const lx = TX - 58, ly = cy + 54;
+    ctx.textAlign = 'left';
+    [
+      { c: C.green,  label: `绿了   [t ${greenLo.toFixed(0)}-${greenHi.toFixed(0)}]` },
+      { c: C.yellow, label: `略早 / 略晚` },
+      { c: C.red,    label: `过早 / 过晚` },
+    ].forEach(({ c, label }, i) => {
+      const ry = ly + i * 20;
+      ctx.fillStyle   = c;
+      ctx.globalAlpha = 0.6;
+      ctx.fillRect(lx, ry - 5, 10, 10);
+      ctx.globalAlpha = 0.45;
+      ctx.fillStyle   = C.label;
+      ctx.fillText(label, lx + 16, ry);
+    });
+    ctx.globalAlpha = 1;
+    ctx.textAlign   = 'center';
+
+  } else if (state.phase === 'result') {
+    const key = state.judgment;
+    const j   = JUDGE[key];
+    const fs  = j.big ? 58 : 46;
+
+    ctx.font      = `bold ${fs}px -apple-system, sans-serif`;
+    ctx.fillStyle = j.color;
+    if (j.big) { ctx.shadowColor = C.green; ctx.shadowBlur = 24; }
+    ctx.fillText(j.label, TX, cy - 22);
+    ctx.shadowBlur = 0;
+
+    const dev = devText(key, state.t);
+    if (dev) {
+      ctx.font      = '15px -apple-system, sans-serif';
+      ctx.fillStyle = C.label;
+      ctx.fillText(dev, TX, cy + 28);
+    }
+  }
+}
+
+function drawSep() {
+  const sx = BAR_X + BAR_W + 38;
+  ctx.strokeStyle = C.barBorder;
+  ctx.lineWidth   = 1;
+  ctx.globalAlpha = 0.35;
+  ctx.beginPath();
+  ctx.moveTo(sx, 44);
+  ctx.lineTo(sx, canvas.height - 44);
+  ctx.stroke();
+  ctx.globalAlpha = 1;
+}
+
+// ── Game loop ──────────────────────────────────────────────────────────────
+function gameLoop(ts) {
+  // Update
+  if (state.phase === 'holding') {
+    if (state.lastTimestamp === null) {
+      state.lastTimestamp = ts;
+    } else {
+      const delta = (ts - state.lastTimestamp) / fillMs * 100;
+      state.lastTimestamp = ts;
+      state.t = Math.min(100, state.t + delta);
+      if (state.t >= 100) triggerResult(100, ts);
+    }
+  }
+  if (state.phase === 'result') {
+    if (ts - state.resultStartTime > RESULT_MS) reset();
+  }
+
+  // Draw
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.fillStyle = C.bg;
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  drawSep();
+  drawBar();
+  drawRightPanel();
+
+  requestAnimationFrame(gameLoop);
+}
+
+requestAnimationFrame(gameLoop);
+</script>
+</body>
+</html>
