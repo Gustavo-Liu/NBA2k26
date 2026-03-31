@@ -16,3 +16,20 @@ Key routing rules:
 - Design system, brand → invoke design-consultation
 - Visual audit, design polish → invoke design-review
 - Architecture review → invoke plan-eng-review
+
+## Project status
+
+This repo currently contains a single-file shot meter prototype in `shot-meter.html`.
+
+Implemented so far:
+- Adjustable green window rating from `60` to `99`
+- Dynamic green release window scaling from the current `48-52` baseline up to `40-60` at rating `99`
+- Adjustable release speed from `300ms` to `1200ms`
+- Desktop keyboard input with `Space`
+- Mobile/touch support using press to hold and release to shoot
+- On-screen controls and status text for current green window and release speed
+
+Behavior notes:
+- Lower `fillMs` is faster; higher `fillMs` is slower
+- Rating `60` matches the original tight window
+- Rating `99` uses the widest current green window: `40-60`
