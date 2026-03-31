@@ -21,33 +21,36 @@
     }
     .controls {
       display: flex;
+      flex-wrap: wrap;
       align-items: center;
-      gap: 10px;
-      padding: 10px 14px;
+      justify-content: center;
+      gap: 6px;
+      padding: 8px 10px;
       border: 1px solid #252550;
-      border-radius: 12px;
+      border-radius: 10px;
       background: rgba(21, 21, 42, 0.92);
       color: #d0d5e8;
+      max-width: calc(100vw - 16px);
     }
     .controls label {
-      font-size: 13px;
+      font-size: 11px;
       color: #a9afd1;
     }
     .controls input[type="range"] {
-      width: 180px;
+      width: 100px;
     }
     .controls input[type="number"] {
-      width: 60px;
-      padding: 4px 6px;
+      width: 44px;
+      padding: 3px 4px;
       border: 1px solid #3d3d6a;
-      border-radius: 8px;
+      border-radius: 6px;
       background: #0f1020;
       color: #ffffff;
-      font-size: 13px;
+      font-size: 11px;
     }
     canvas {
       display: block;
-      max-width: min(700px, calc(100vw - 24px));
+      width: min(700px, calc(100vw - 16px));
       height: auto;
       touch-action: none;
     }
